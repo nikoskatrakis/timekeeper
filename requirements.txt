@@ -1,0 +1,8 @@
+# Timekeeper — Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# macOS only: pyobjc-framework-Cocoa is required for native menu bar integration.
+
+PySide6>=6.5.0
+openpyxl>=3.1.0
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
