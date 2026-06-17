@@ -52,15 +52,22 @@ def get_or_create_data_dir() -> Path:
     return data_dir
 
 # ── Sound helper ──────────────────────────────────────────────────────────────
-def play_sound(name: str) -> None:
+def play_sound(name: str, rate: float = 1.0, volume: float = 1.0) -> None:
     """Play a named macOS system sound via afplay. Fails silently."""
     sounds = {
         "Glass": "/System/Library/Sounds/Glass.aiff",
+        "Funk":  "/System/Library/Sounds/Funk.aiff",
         "Tink":  "/System/Library/Sounds/Tink.aiff",
     }
     path = sounds.get(name)
     if path:
-        subprocess.Popen(["afplay", path])
+        cmd = ["afplay"]
+        if rate != 1.0:
+            cmd += ["-r", str(rate)]
+        if volume != 1.0:
+            cmd += ["-v", str(volume)]
+        cmd.append(path)
+        subprocess.Popen(cmd)
 
 
 # ── Data Models ───────────────────────────────────────────────────────────────
@@ -101,6 +108,10 @@ class IStorage(ABC):
     def get_time_entries(self) -> List[TimeEntry]: ...
     @abstractmethod
     def get_today_count(self) -> int: ...
+    @abstractmethod
+    def get_setting(self, key: str) -> Optional[str]: ...
+    @abstractmethod
+    def set_setting(self, key: str, value: str) -> None: ...
 
 
 class SQLiteStorage(IStorage):
@@ -121,6 +132,9 @@ class SQLiteStorage(IStorage):
                     task_name TEXT NOT NULL, start_time TEXT NOT NULL,
                     end_time TEXT, manually_added INTEGER DEFAULT 0,
                     notes TEXT DEFAULT "")''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
 
     def save_task(self, task: Task) -> None:
         with sqlite3.connect(self.db_path) as conn:
@@ -168,6 +182,15 @@ class SQLiteStorage(IStorage):
                 (today,)
             ).fetchone()
         return row[0] if row else 0
+
+    def get_setting(self, key: str) -> Optional[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, value))
 
 
 # ── Timer Engine ──────────────────────────────────────────────────────────────
@@ -328,6 +351,12 @@ QPushButton#stop { background:#C0392B; }
 QPushButton#stop:hover{ background:#E74C3C; }
 QSpinBox         { background:#2C3E50; color:#ECEFF1; border:none;
                    padding:4px; border-radius:4px; }
+QDialog          { background:#1E2329; color:#ECEFF1; }
+QListView        { background:#2C3E50; color:#ECEFF1; border:none; }
+QListView::item:selected { background:#27AE60; color:#ECEFF1; }
+QListView::item:hover    { background:#34495E; color:#ECEFF1; }
+QLineEdit        { background:#2C3E50; color:#ECEFF1; border:none;
+                   padding:4px; border-radius:4px; }
 """
 
 CLR_TASK  = "#ECEFF1"
@@ -486,7 +515,11 @@ class MainPanel(QWidget):
     def _load_tasks(self) -> None:
         self._tasks = self._storage.get_tasks()
         if self._tasks:
-            self._current_task = self._tasks[0]
+            last_id = self._storage.get_setting('last_task_id')
+            self._current_task = (
+                next((t for t in self._tasks if t.id == last_id), None)
+                or self._tasks[0]
+            )
             self._task_lbl.setText(self._current_task.name)
 
     def _on_app_state_changed(self, state) -> None:
@@ -519,11 +552,11 @@ class MainPanel(QWidget):
 
     def _on_complete(self) -> None:
         if self._engine.is_break:
-            play_sound("Tink")
+            play_sound("Funk")
             self._preload_task()
         else:
-            play_sound("Glass")
-            self._save_current_period()
+            play_sound("Glass", rate=0.2, volume=5)
+            self._save_current_period(update_counter=True)
             self._preload_break()
 
     # ── State transitions ─────────────────────────────────────────────────────
@@ -556,6 +589,8 @@ class MainPanel(QWidget):
         if not self._current_task:
             QMessageBox.warning(self, "No Task", "Create or select a task first.")
             return
+        self._update_today_count()  # refresh in case date changed since startup
+        self._storage.set_setting('last_task_id', self._current_task.id)
         self._task_period_start = datetime.now()
         self._engine.start(self._task_mins * 60, is_break=False)
         self._mode = "task"
@@ -579,7 +614,7 @@ class MainPanel(QWidget):
 
     def _stop_timer(self) -> None:
         if self._mode in ("task", "task_paused"):
-            self._save_current_period()
+            self._save_current_period(update_counter=True)
             self._preload_break()
         elif self._mode in ("break", "break_paused"):
             self._engine.stop()
@@ -605,11 +640,12 @@ class MainPanel(QWidget):
         self._clock_lbl.setText(TimerEngine.format_time(secs))
         self._clock_lbl.setStyleSheet(f"color:{CLR_TASK}; letter-spacing:3px;")
         self._progress.set_value(1.0, is_break=False)
-        self._set_mode("Break complete — press Start Task when ready", CLR_READY)
+        task_name = self._current_task.name if self._current_task else "task"
+        self._set_mode(f"{task_name} — press Start Task when ready", CLR_READY)
 
     # ── Split-time tracking ───────────────────────────────────────────────────
 
-    def _save_current_period(self) -> None:
+    def _save_current_period(self, update_counter: bool = False) -> None:
         if self._task_period_start and self._current_task:
             self._storage.save_time_entry(TimeEntry(
                 task_id=self._current_task.id,
@@ -619,7 +655,8 @@ class MainPanel(QWidget):
             ))
             self._task_period_start = None
             self._refresh_excel()
-            self._update_today_count()
+            if update_counter:
+                self._update_today_count()
 
     # ── Task management ───────────────────────────────────────────────────────
 
@@ -633,6 +670,7 @@ class MainPanel(QWidget):
             self._storage.save_task(task)
             self._tasks.append(task)
             self._current_task = task
+            self._storage.set_setting('last_task_id', task.id)
             self._task_lbl.setText(task.name)
             if self._mode in ("task", "task_paused"):
                 self._set_mode(f"Working on: {task.name}", CLR_READY)
@@ -662,6 +700,7 @@ class MainPanel(QWidget):
             self._save_current_period()
             self._task_period_start = datetime.now()
         self._current_task = new_task
+        self._storage.set_setting('last_task_id', new_task.id)
         self._task_lbl.setText(new_task.name)
         if self._mode in ("task", "task_paused"):
             self._set_mode(f"Working on: {new_task.name}", CLR_READY)
@@ -747,12 +786,14 @@ class _ClickHandler(NSObject):
         if self._panel is None:
             return
         if self._panel.isMinimized():
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             self._panel.showNormal()
             self._panel.raise_()
             self._panel.activateWindow()
         elif self._panel.isVisible():
             self._panel.hide()
         else:
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             self._panel.show()
             self._panel.raise_()
             self._panel.activateWindow()
