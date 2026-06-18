@@ -967,7 +967,7 @@ class TimekeeperApp:
 
     def run(self) -> None:
         self._panel.show()
-        self._panel.setWindowTitle(f"{APP_NAME} {APP_VERSION}")  # set after show() so NSWindow exists
+        self._panel.setWindowTitle(APP_NAME)  # version shown in About, not title bar
         self._panel.raise_()
         # Get the NSWindow directly from the NSView via winId(), then
         # disable both hidesOnDeactivate and floatingPanel so the window
