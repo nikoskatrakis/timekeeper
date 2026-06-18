@@ -6,7 +6,7 @@ Deps: pip install PySide6 openpyxl pyobjc-framework-Cocoa
 """
 
 # ── Imports, Configuration, Sound Helper & First-launch Dir Picker ────────────
-import sys, os, uuid, sqlite3, subprocess
+import sys, os, uuid, sqlite3, subprocess, ctypes
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -27,6 +27,7 @@ from openpyxl.utils import get_column_letter
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 APP_NAME           = "Timekeeper"
+APP_VERSION        = "v0.00006"
 CONFIG_PATH        = Path.home() / ".timekeeper_config"
 DEFAULT_TASK_MINS  = 30
 DEFAULT_BREAK_MINS = 5
@@ -469,27 +470,28 @@ class MainPanel(QWidget):
         self._ready = True
 
     def _build_ui(self) -> None:
-        self.setWindowTitle(APP_NAME)
-        self.setMinimumWidth(420)
-        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setMinimumWidth(280)
+        self.setWindowFlags(Qt.Window)
         self.setStyleSheet(STYLE)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
+        root.setContentsMargins(12, 16, 12, 16)
         root.setSpacing(14)
 
-        # Top row: hamburger menu + task name
+        # Top row: hamburger menu (left) + task name (centred) + balancing spacer (right)
         task_row = QHBoxLayout()
         self._menu_btn = QPushButton("☰")
         self._menu_btn.setFixedWidth(36)
         self._menu_btn.setToolTip("Menu")
         self._menu_btn.clicked.connect(self._show_menu)
         task_row.addWidget(self._menu_btn)
-        task_row.addSpacing(8)
         self._task_lbl = QLabel("No task — open menu to create one")
         self._task_lbl.setFont(QFont("Helvetica Neue", 16, QFont.Bold))
-        task_row.addWidget(self._task_lbl)
-        task_row.addStretch()
+        self._task_lbl.setAlignment(Qt.AlignCenter)
+        task_row.addWidget(self._task_lbl, 1)
+        spacer = QWidget()
+        spacer.setFixedWidth(36)
+        task_row.addWidget(spacer)
         root.addLayout(task_row)
 
         # Today counter
@@ -542,6 +544,20 @@ class MainPanel(QWidget):
         ctrl_row.addStretch()
         root.addLayout(ctrl_row)
 
+    def _show_about(self) -> None:
+        QMessageBox.information(self, "About Timekeeper",
+            f"Timekeeper {APP_VERSION}\n\n"
+            "An open-source time tracking app for macOS (only, for now).\n\n"
+            "Track tasks, record intervals, and exports to Excel."
+        )
+
+    def _show_shortcuts(self) -> None:
+        QMessageBox.information(self, "Keyboard Shortcuts",
+            "Ctrl + B    Start / Pause interval\n"
+            "Ctrl + S    Stop interval\n"
+            "Ctrl + M    Open menu - then navigate as usual"
+        )
+
     def _show_menu(self) -> None:
         menu = QMenu(self)
         menu.addAction("＋  New Task",                self._new_task)
@@ -558,6 +574,8 @@ class MainPanel(QWidget):
         menu.addAction("\U0001f5c4  Open Database",       self._open_db)
         menu.addAction("\U0001f4ca  Export & Open Excel", self._export_and_open_excel)
         menu.addSeparator()
+        menu.addAction("ℹ  About",                       self._show_about)
+        menu.addAction("⌨  Keyboard Shortcuts",          self._show_shortcuts)
         menu.addAction("Quit Timekeeper",                 self._quit)
         pos = self._menu_btn.mapToGlobal(self._menu_btn.rect().bottomLeft())
         menu.exec(pos)
@@ -584,7 +602,7 @@ class MainPanel(QWidget):
     def _connect_signals(self) -> None:
         self._engine.tick.connect(self._on_tick)
         self._engine.completed.connect(self._on_complete)
-        QApplication.instance().applicationStateChanged.connect(self._on_app_state_changed)
+
 
     def _load_tasks(self) -> None:
         self._tasks = self._storage.get_tasks()
@@ -595,19 +613,6 @@ class MainPanel(QWidget):
                 or self._tasks[0]
             )
             self._task_lbl.setText(self._current_task.name)
-
-    def _on_app_state_changed(self, state) -> None:
-        if state != Qt.ApplicationState.ApplicationActive:
-            if (QApplication.activeModalWidget() is None
-                    and QApplication.activePopupWidget() is None):
-                QTimer.singleShot(300, self._maybe_hide)
-
-    def _maybe_hide(self) -> None:
-        app = QApplication.instance()
-        if (app.applicationState() != Qt.ApplicationState.ApplicationActive
-                and QApplication.activeModalWidget() is None
-                and QApplication.activePopupWidget() is None):
-            self.hide()
 
     def _update_today_count(self) -> None:
         count = self._storage.get_today_count()
@@ -831,6 +836,17 @@ class MainPanel(QWidget):
     def _refresh_excel(self) -> None:
         self._exporter.export(self._storage.get_time_entries(), self._storage.get_tasks())
 
+    def keyPressEvent(self, event) -> None:
+        if event.modifiers() == Qt.MetaModifier:
+            k = event.key()
+            if k == Qt.Key_B:
+                self._on_start_clicked(); return
+            elif k == Qt.Key_C:
+                self._stop_timer(); return
+            elif k == Qt.Key_M:
+                self._show_menu(); return
+        super().keyPressEvent(event)
+
     def closeEvent(self, event) -> None:
         if not self._ready:
             event.accept()
@@ -845,7 +861,7 @@ class MainPanel(QWidget):
 import objc
 from AppKit import (
     NSObject, NSStatusBar, NSVariableStatusItemLength,
-    NSApplication, NSApplicationActivationPolicyRegular
+    NSApplication, NSApplicationActivationPolicyRegular,
 )
 
 if '_ClickHandler' not in dir():
@@ -947,9 +963,20 @@ class TimekeeperApp:
         self._menu_bar = MenuBarManager(engine, panel)
         self._panel    = panel
 
+
+
     def run(self) -> None:
         self._panel.show()
+        self._panel.setWindowTitle(f"{APP_NAME} {APP_VERSION}")  # set after show() so NSWindow exists
         self._panel.raise_()
+        # Get the NSWindow directly from the NSView via winId(), then
+        # disable both hidesOnDeactivate and floatingPanel so the window
+        # stays visible when the app is deactivated (e.g. Cmd+Tab).
+        import objc
+        ns_view = objc.objc_object(c_void_p=ctypes.c_void_p(int(self._panel.winId())))
+        ns_window = ns_view.window()
+        if ns_window is not None:
+            ns_window.setHidesOnDeactivate_(False)
         self._qt.exec()
 
 

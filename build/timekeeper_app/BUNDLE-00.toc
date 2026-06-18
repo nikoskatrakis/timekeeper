@@ -1,0 +1,3 @@
+([('timekeeper',
+   '/Users/nikos/Documents/Timekeeper/dist/timekeeper',
+   'EXECUTABLE')],)
