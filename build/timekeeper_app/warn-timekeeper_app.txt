@@ -20,6 +20,7 @@ missing module named winreg - imported by importlib._bootstrap_external (conditi
 missing module named nt - imported by shutil (conditional), importlib._bootstrap_external (conditional), ntpath (optional), _colorize (delayed, conditional, optional), os (delayed, conditional, optional), ctypes (delayed, conditional)
 missing module named _frozen_importlib_external - imported by importlib._bootstrap (delayed), importlib (optional), importlib.abc (optional)
 excluded module named _frozen_importlib - imported by importlib (optional), importlib.abc (optional)
+missing module named AppKit.NSWorkspace - imported by AppKit (top-level), /Users/nikos/Documents/Timekeeper/timekeeper_app.py (top-level)
 missing module named AppKit.NSApplicationActivationPolicyRegular - imported by AppKit (top-level), /Users/nikos/Documents/Timekeeper/timekeeper_app.py (top-level)
 missing module named AppKit.NSApplication - imported by AppKit (top-level), /Users/nikos/Documents/Timekeeper/timekeeper_app.py (top-level)
 missing module named AppKit.NSVariableStatusItemLength - imported by AppKit (top-level), /Users/nikos/Documents/Timekeeper/timekeeper_app.py (top-level)

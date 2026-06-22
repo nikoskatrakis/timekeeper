@@ -27,7 +27,7 @@ from openpyxl.utils import get_column_letter
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 APP_NAME           = "Timekeeper"
-APP_VERSION        = "v0.00006"
+APP_VERSION        = "v0.00001"
 CONFIG_PATH        = Path.home() / ".timekeeper_config"
 DEFAULT_TASK_MINS  = 30
 DEFAULT_BREAK_MINS = 5
@@ -96,9 +96,12 @@ class TimeEntry:
     manually_added: bool               = False
     notes:          str                = ""
     interval_id:    Optional[str]      = None
+    active_secs:    Optional[int]      = None  # actual work time, excludes pauses & sleep
 
     @property
     def duration_minutes(self) -> float:
+        if self.active_secs is not None:
+            return self.active_secs / 60
         if self.end_time:
             return (self.end_time - self.start_time).total_seconds() / 60
         return 0.0
@@ -145,7 +148,13 @@ class SQLiteStorage(IStorage):
                     id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
                     task_name TEXT NOT NULL, start_time TEXT NOT NULL,
                     end_time TEXT, manually_added INTEGER DEFAULT 0,
-                    notes TEXT DEFAULT "", interval_id TEXT)''')
+                    notes TEXT DEFAULT "", interval_id TEXT,
+                    active_secs INTEGER)''')
+            # Migration: add active_secs to existing databases that predate this column
+            try:
+                conn.execute('ALTER TABLE time_entries ADD COLUMN active_secs INTEGER')
+            except sqlite3.OperationalError:
+                pass  # column already exists
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
@@ -172,11 +181,12 @@ class SQLiteStorage(IStorage):
 
     def save_time_entry(self, entry: TimeEntry) -> None:
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute('INSERT INTO time_entries VALUES (?,?,?,?,?,?,?,?)',
+            conn.execute('INSERT INTO time_entries VALUES (?,?,?,?,?,?,?,?,?)',
                 (str(uuid.uuid4()), entry.task_id, entry.task_name,
                  entry.start_time.isoformat(),
                  entry.end_time.isoformat() if entry.end_time else None,
-                 int(entry.manually_added), entry.notes, entry.interval_id))
+                 int(entry.manually_added), entry.notes, entry.interval_id,
+                 entry.active_secs))
 
     def get_time_entries(self) -> List[TimeEntry]:
         with sqlite3.connect(self.db_path) as conn:
@@ -185,7 +195,8 @@ class SQLiteStorage(IStorage):
                           start_time=datetime.fromisoformat(r[3]),
                           end_time=datetime.fromisoformat(r[4]) if r[4] else None,
                           manually_added=bool(r[5]), notes=r[6] or "",
-                          interval_id=r[7] if len(r) > 7 else None) for r in rows]
+                          interval_id=r[7] if len(r) > 7 else None,
+                          active_secs=r[8] if len(r) > 8 else None) for r in rows]
 
     def get_today_count(self) -> int:
         today = datetime.now().date().isoformat()
@@ -453,11 +464,15 @@ class MainPanel(QWidget):
         self._exporter   = exporter
         self._excel_path = excel_path
 
-        self._current_task:       Optional[Task]     = None
-        self._tasks:              List[Task]          = []
-        self._task_period_start:  Optional[datetime] = None
-        self._mode:               str                = "idle"
-        self._interval_id:        Optional[str]      = None
+        self._current_task:          Optional[Task]     = None
+        self._tasks:                 List[Task]          = []
+        self._task_period_start:     Optional[datetime] = None
+        self._segment_start:         Optional[datetime] = None  # start of current active run
+        self._active_secs:           int               = 0     # accumulated active secs
+        self._auto_paused_for_sleep: bool              = False
+        self._sleep_time:            Optional[datetime] = None
+        self._mode:                  str               = "idle"
+        self._interval_id:           Optional[str]     = None
         self._task_mins:          int                = DEFAULT_TASK_MINS
         self._break_mins:         int                = DEFAULT_BREAK_MINS
         self._daily_goal:         int                = DEFAULT_DAILY_GOAL
@@ -637,7 +652,7 @@ class MainPanel(QWidget):
             play_sound("Funk", volume=300)
             self._preload_task()
         else:
-            play_sound("Glass", rate=0.2, volume=300)
+            play_sound("Glass", rate=0.2, volume=10)
             self._save_current_period(update_counter=True)
             self._preload_break()
 
@@ -647,10 +662,14 @@ class MainPanel(QWidget):
         elif self._mode == "task_ready":
             self._begin_task()
         elif self._mode == "task":
+            if self._segment_start:
+                self._active_secs += int((datetime.now() - self._segment_start).total_seconds())
+                self._segment_start = None
             self._engine.pause()
             self._mode = "task_paused"
             self._start_btn.setText("▶  Resume")
         elif self._mode == "task_paused":
+            self._segment_start = datetime.now()
             self._engine.resume()
             self._mode = "task"
             self._start_btn.setText("⏸  Pause")
@@ -674,6 +693,8 @@ class MainPanel(QWidget):
         if self._interval_id is None:
             self._interval_id = self._storage.get_next_interval_id()
         self._task_period_start = datetime.now()
+        self._segment_start     = datetime.now()
+        self._active_secs       = 0
         self._engine.start(self._task_mins * 60, is_break=False)
         self._mode = "task"
         self._start_btn.setText("⏸  Pause")
@@ -725,14 +746,21 @@ class MainPanel(QWidget):
 
     def _save_current_period(self, update_counter: bool = False) -> None:
         if self._task_period_start and self._current_task:
+            # Compute actual active secs — excludes pauses and sleep time
+            active = self._active_secs
+            if self._segment_start:
+                active += int((datetime.now() - self._segment_start).total_seconds())
             self._storage.save_time_entry(TimeEntry(
                 task_id=self._current_task.id,
                 task_name=self._current_task.name,
                 start_time=self._task_period_start,
                 end_time=datetime.now(),
-                interval_id=self._interval_id
+                interval_id=self._interval_id,
+                active_secs=active,
             ))
             self._task_period_start = None
+            self._segment_start     = None
+            self._active_secs       = 0
             if update_counter:
                 self._interval_id = None
             self._refresh_excel()
@@ -745,6 +773,8 @@ class MainPanel(QWidget):
             if self._mode in ("task", "task_paused") and self._current_task:
                 self._save_current_period()
                 self._task_period_start = datetime.now()
+                self._active_secs       = 0
+                self._segment_start     = datetime.now() if self._mode == "task" else None
             task = Task(name=name.strip())
             self._storage.save_task(task)
             self._tasks.append(task)
@@ -778,6 +808,8 @@ class MainPanel(QWidget):
         if self._mode in ("task", "task_paused") and self._current_task:
             self._save_current_period()
             self._task_period_start = datetime.now()
+            self._active_secs       = 0
+            self._segment_start     = datetime.now() if self._mode == "task" else None
         self._current_task = new_task
         self._storage.set_setting('last_task_id', new_task.id)
         self._task_lbl.setText(new_task.name)
@@ -847,6 +879,34 @@ class MainPanel(QWidget):
                 self._show_menu(); return
         super().keyPressEvent(event)
 
+    def _on_system_sleep(self) -> None:
+        """Auto-pause the timer when Mac sleeps so sleep time isn't counted as work."""
+        self._sleep_time = datetime.now()
+        if self._mode == "task":
+            if self._segment_start:
+                self._active_secs += int((datetime.now() - self._segment_start).total_seconds())
+                self._segment_start = None
+            self._engine.pause()
+            self._mode = "task_paused"
+            self._start_btn.setText("▶  Resume")
+            self._auto_paused_for_sleep = True
+
+    def _on_system_wake(self) -> None:
+        """After Mac wakes, notify the user if the timer was auto-paused during sleep."""
+        if not self._auto_paused_for_sleep:
+            return
+        self._auto_paused_for_sleep = False
+        if self._sleep_time:
+            sleep_mins = int((datetime.now() - self._sleep_time).total_seconds() / 60)
+            self._sleep_time = None
+            QMessageBox.information(
+                self,
+                "Mac woke from sleep",
+                f"Mac was asleep for {sleep_mins} minute(s).\n"
+                f"The timer was paused to keep your time accurate.\n"
+                f"Press Resume when you're ready to continue."
+            )
+
     def closeEvent(self, event) -> None:
         if not self._ready:
             event.accept()
@@ -862,7 +922,30 @@ import objc
 from AppKit import (
     NSObject, NSStatusBar, NSVariableStatusItemLength,
     NSApplication, NSApplicationActivationPolicyRegular,
+    NSWorkspace,
 )
+
+if '_SleepWakeObserver' not in dir():
+    class _SleepWakeObserver(NSObject):
+        """Objective-C observer for macOS sleep/wake notifications."""
+
+        def init(self):
+            self = objc.super(_SleepWakeObserver, self).init()
+            self._panel = None
+            return self
+
+        def setPanel_(self, panel) -> None:
+            self._panel = panel
+
+        def handleSleep_(self, notification) -> None:
+            if self._panel:
+                self._panel._on_system_sleep()
+
+        def handleWake_(self, notification) -> None:
+            if self._panel:
+                # Small delay so Qt is fully awake before showing a dialog
+                QTimer.singleShot(800, self._panel._on_system_wake)
+
 
 if '_ClickHandler' not in dir():
     class _ClickHandler(NSObject):
@@ -962,6 +1045,17 @@ class TimekeeperApp:
 
         self._menu_bar = MenuBarManager(engine, panel)
         self._panel    = panel
+
+        # Register sleep/wake observer so the timer auto-pauses on lid-close/sleep
+        self._sleep_observer = _SleepWakeObserver.alloc().init()
+        self._sleep_observer.setPanel_(panel)
+        nc = NSWorkspace.sharedWorkspace().notificationCenter()
+        nc.addObserver_selector_name_object_(
+            self._sleep_observer, 'handleSleep:', 'NSWorkspaceWillSleepNotification', None
+        )
+        nc.addObserver_selector_name_object_(
+            self._sleep_observer, 'handleWake:', 'NSWorkspaceDidWakeNotification', None
+        )
 
 
 
